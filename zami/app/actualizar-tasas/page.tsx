@@ -1,0 +1,624 @@
+"use client"
+
+import type React from "react"
+
+import { useState, useEffect, useRef } from "react"
+import { formatBcv, parseDolarRates, type DolarRate } from "@/lib/dolar-provider"
+import { useRouter } from "next/navigation"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import { ArrowLeft, Trash2, RefreshCw, Clock, Info } from "lucide-react"
+import { useAuth } from "@/components/auth-context"
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+
+interface RateHistory {
+  id: number
+  bcv: number
+  brlSell: number
+  brlBuy: number
+  percentage: number
+  date: string
+  time: string
+  updatedBy: string
+  updatedAt: string
+}
+
+export default function ActualizarTasasPage() {
+  const router = useRouter()
+  const { user } = useAuth()
+
+  // Estados para los campos del formulario
+  const [bcv, setBcv] = useState("")
+  const bcvEdited = useRef(false)
+  const [brlSell, setBrlSell] = useState("")
+  const [brlBuy, setBrlBuy] = useState("")
+  const [percentage, setPercentage] = useState("")
+
+  // Estados para el manejo de la UI
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [success, setSuccess] = useState<string | null>(null)
+  const [initialLoading, setInitialLoading] = useState(true)
+
+  // Estados para el historial
+  const [history, setHistory] = useState<RateHistory[]>([])
+  const [loadingHistory, setLoadingHistory] = useState(false)
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [selectedHistoryItem, setSelectedHistoryItem] = useState<RateHistory | null>(null)
+
+  // Estado para las tasas de dólar
+  const [dolarRates, setDolarRates] = useState<DolarRate[]>([])
+  const [loadingDolarRates, setLoadingDolarRates] = useState(false)
+  const [dolarError, setDolarError] = useState<string | null>(null)
+  const [bcvSource, setBcvSource] = useState("Tasa guardada; puede editarla.")
+
+  // Verificar permisos al cargar
+  useEffect(() => {
+    const checkAuth = async () => {
+      if (!user) {
+        // Esperar a que cargue el usuario
+        return
+      }
+
+      setInitialLoading(false)
+
+      // Redirigir si no es admin o agente
+      if (user.role !== "administrador" && user.role !== "agente") {
+        router.push("/")
+      } else {
+        // Cargar tasas actuales e historial
+        loadRatesHistory()
+        // Primero la base, luego el proveedor: la respuesta guardada no pisa la oficial.
+        await loadCurrentRates()
+        await loadDolarRates()
+      }
+    }
+
+    checkAuth()
+  }, [user, router])
+
+  // Cargar tasas de dólar
+  const loadDolarRates = async (applyOfficial = false) => {
+    try {
+      setLoadingDolarRates(true)
+      setDolarError(null)
+      const response = await fetch("https://ve.dolarapi.com/v1/dolares", {
+        cache: "no-store", signal: AbortSignal.timeout(15000),
+      })
+
+      if (!response.ok) {
+        throw new Error("Error al cargar tasas de dólar")
+      }
+
+      const data = parseDolarRates(await response.json())
+      setDolarRates(data)
+      const official = data.find(rate => rate.fuente.toLowerCase() === "oficial")!
+      // Una respuesta lenta no debe sobrescribir una edición manual ni el historial.
+      if (applyOfficial || !bcvEdited.current) {
+        setBcv(formatBcv(official.promedio))
+        bcvEdited.current = false
+        setBcvSource(`BCV oficial de DolarAPI. Fecha publicada: ${formatDate(official.fechaActualizacion)}. Editable; se guardará sólo al pulsar Guardar Tasas.`)
+      }
+    } catch (error) {
+      console.error("Error cargando tasas de dólar:", error)
+      setDolarError("No se pudo obtener el BCV oficial. Se conserva el valor del campo; puede editarlo o reintentar.")
+    } finally {
+      setLoadingDolarRates(false)
+    }
+  }
+
+  // Formatear fecha
+  const formatDate = (dateString: string) => {
+    return new Intl.DateTimeFormat("es-VE", {
+      timeZone: "America/Caracas", day: "2-digit", month: "2-digit", year: "numeric",
+      hour: "2-digit", minute: "2-digit",
+    }).format(new Date(dateString))
+  }
+
+  // Cargar tasas actuales
+  const loadCurrentRates = async () => {
+    try {
+      const response = await fetch("/api/tasas")
+
+      if (!response.ok) {
+        throw new Error("Error al cargar tasas actuales")
+      }
+
+      const data = await response.json()
+
+      // Establecer valores iniciales
+      if (!bcvEdited.current) setBcv(formatBcv(data.bcv))
+      setBrlSell(data.brlSell.toString())
+      setBrlBuy(data.brlBuy.toString())
+      setPercentage(data.percentage.toString())
+    } catch (error) {
+      console.error("Error cargando tasas:", error)
+      setError("Error al cargar tasas actuales")
+    }
+  }
+
+  // Cargar historial de tasas
+  const loadRatesHistory = async () => {
+    try {
+      setLoadingHistory(true)
+      const response = await fetch("/api/tasas/history")
+
+      if (!response.ok) {
+        throw new Error("Error al cargar historial de tasas")
+      }
+
+      const data = await response.json()
+      setHistory(data)
+    } catch (error) {
+      console.error("Error cargando historial:", error)
+    } finally {
+      setLoadingHistory(false)
+    }
+  }
+
+  // Eliminar entrada del historial
+  const deleteHistoryEntry = async (id: number) => {
+    try {
+      setLoading(true)
+
+      const response = await fetch("/api/tasas/history/delete", {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ id }),
+        credentials: "include", // Asegura que se envíen las cookies con la solicitud
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json()
+        throw new Error(errorData.error || "Error al eliminar entrada del historial")
+      }
+
+      setSuccess("Entrada eliminada correctamente")
+
+      // Recargar historial
+      loadRatesHistory()
+
+      // Cerrar diálogo
+      setShowDeleteDialog(false)
+      setSelectedHistoryItem(null)
+
+      // Limpiar mensaje después de 3 segundos
+      setTimeout(() => {
+        setSuccess(null)
+      }, 3000)
+    } catch (error) {
+      console.error("Error:", error)
+      setError(error instanceof Error ? error.message : "Error desconocido")
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // Cargar tasas desde el historial
+  const loadFromHistory = (item: RateHistory) => {
+    bcvEdited.current = true
+    setBcv(formatBcv(item.bcv))
+    setBcvSource("Tasa cargada del historial. Editable; pendiente de guardar.")
+    setBrlSell(item.brlSell.toString())
+    setBrlBuy(item.brlBuy.toString())
+    setPercentage(item.percentage.toString())
+
+    setSuccess("Tasas cargadas desde el historial")
+
+    // Limpiar mensaje después de 3 segundos
+    setTimeout(() => {
+      setSuccess(null)
+    }, 3000)
+  }
+
+  // Calcular tasa de compra basada en tasa de venta y porcentaje
+  useEffect(() => {
+    if (brlSell && percentage) {
+      try {
+        const sellValue = Number.parseFloat(brlSell)
+        const percentageValue = Number.parseFloat(percentage)
+
+        if (!isNaN(sellValue) && !isNaN(percentageValue)) {
+          const buyValue = sellValue * (1 + percentageValue / 100)
+          setBrlBuy(buyValue.toFixed(2))
+        }
+      } catch (error) {
+        console.error("Error calculando tasa de compra:", error)
+      }
+    }
+  }, [brlSell, percentage])
+
+  // Validar entrada numérica
+  const handleNumberInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const { name } = e.target
+    const value = name === "bcv" ? e.target.value.replace(",", ".") : e.target.value
+
+    // Solo permitir números y punto decimal
+    if (!/^[0-9]*\.?[0-9]*$/.test(value) && value !== "") {
+      return
+    }
+
+    switch (name) {
+      case "bcv":
+        bcvEdited.current = true
+        setBcv(value)
+        setBcvSource("Tasa editada manualmente. Pendiente de guardar.")
+        break
+      case "brlSell":
+        setBrlSell(value)
+        break
+      case "brlBuy":
+        setBrlBuy(value)
+        break
+      case "percentage":
+        setPercentage(value)
+        break
+    }
+  }
+
+  // Enviar formulario
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+
+    // Limpiar mensajes
+    setError(null)
+    setSuccess(null)
+    setLoading(true)
+
+    try {
+      // Validar datos
+      const bcvValue = Number(formatBcv(Number(bcv)))
+      setBcv(formatBcv(bcvValue))
+      bcvEdited.current = true
+      const brlSellValue = Number.parseFloat(brlSell)
+      const brlBuyValue = Number.parseFloat(brlBuy)
+      const percentageValue = Number.parseFloat(percentage)
+
+      if (isNaN(bcvValue) || isNaN(brlSellValue) || isNaN(brlBuyValue) || isNaN(percentageValue)) {
+        throw new Error("Todos los campos deben ser números válidos")
+      }
+
+      if (bcvValue <= 0 || brlSellValue <= 0 || brlBuyValue <= 0) {
+        throw new Error("Los valores deben ser mayores que cero")
+      }
+
+      // Preparar datos
+      const data = {
+        bcv: bcvValue,
+        brlSell: brlSellValue,
+        brlBuy: brlBuyValue,
+        percentage: percentageValue,
+      }
+
+      // Enviar solicitud
+      const response = await fetch("/api/tasas", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      })
+
+      // Verificar respuesta
+      if (!response.ok) {
+        let errorMessage = "Error al guardar tasas"
+
+        try {
+          const errorData = await response.json()
+          errorMessage = errorData.error || errorMessage
+        } catch (e) {
+          // Si no se puede parsear como JSON
+          console.error("Error parsing response:", e)
+        }
+
+        throw new Error(errorMessage)
+      }
+
+      // Procesar respuesta exitosa
+      const responseData = await response.json()
+
+      setSuccess("Tasas actualizadas correctamente")
+
+      // Recargar tasas actuales e historial
+      setTimeout(() => {
+        loadCurrentRates()
+        loadRatesHistory()
+        setSuccess(null)
+      }, 2000)
+    } catch (error) {
+      console.error("Error:", error)
+      setError(error instanceof Error ? error.message : "Error desconocido")
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // Abrir diálogo de confirmación para eliminar
+  const openDeleteDialog = (item: RateHistory) => {
+    setSelectedHistoryItem(item)
+    setShowDeleteDialog(true)
+  }
+
+  if (initialLoading) {
+    return (
+      <div className="flex justify-center items-center min-h-screen bg-slate-950">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white"></div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-white p-4">
+      <div className="max-w-4xl mx-auto">
+        <div className="flex justify-between items-center mb-6">
+          <Button variant="outline" onClick={() => router.push("/")} className="flex items-center gap-1">
+            <ArrowLeft className="h-4 w-4" />
+            <span>Volver</span>
+          </Button>
+          <h1 className="text-xl font-bold">Actualizar Tasas</h1>
+        </div>
+
+        {/* Observaciones - Tasas de Dólar */}
+        <Card className="bg-slate-800 border-slate-700 mb-6">
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-lg">
+              <Info className="h-5 w-5" />
+              <span>Observaciones - Tasas de Dólar</span>
+            </CardTitle>
+            <Button variant="outline" size="sm" onClick={() => loadDolarRates(true)} disabled={loadingDolarRates}>
+              <RefreshCw className="h-4 w-4 mr-1" />
+              Usar BCV oficial
+            </Button>
+          </CardHeader>
+          <CardContent>
+            {dolarError && <p role="alert" className="text-amber-300 mb-3">{dolarError}</p>}
+            {loadingDolarRates ? (
+              <div className="flex justify-center items-center py-4">
+                <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-white"></div>
+              </div>
+            ) : dolarRates.length === 0 ? (
+              <div className="text-center py-2 text-gray-400">No hay información disponible</div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {dolarRates.map((rate, index) => (
+                  <div key={index} className="bg-slate-700 p-3 rounded-md">
+                    <div className="flex justify-between mb-1">
+                      <span className="text-gray-300">Fuente:</span>
+                      <span className="font-medium">{rate.nombre}</span>
+                    </div>
+                    <div className="flex justify-between mb-1">
+                      <span className="text-gray-300">Tasa:</span>
+                      <span className="font-medium">{rate.promedio.toFixed(2)} Bs</span>
+                    </div>
+                    <div className="flex justify-between text-xs text-gray-400">
+                      <span>Actualizado:</span>
+                      <span>{formatDate(rate.fechaActualizacion)}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {error && (
+          <Alert variant="destructive" className="mb-4 bg-red-900 border-red-800">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+
+        {success && (
+          <Alert className="mb-4 bg-green-900 border-green-800">
+            <AlertDescription>{success}</AlertDescription>
+          </Alert>
+        )}
+
+        <Card className="bg-slate-800 border-slate-700 mb-6">
+          <CardHeader>
+            <CardTitle className="text-center">Actualizar Tasas de Cambio</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="bcv">Dólar BCV</Label>
+                <Input
+                  id="bcv"
+                  name="bcv"
+                  inputMode="decimal"
+                  value={bcv}
+                  onChange={handleNumberInput}
+                  onBlur={() => {
+                    const value = Number(bcv)
+                    if (bcv && Number.isFinite(value) && value > 0 && value < 1_000_000) setBcv(formatBcv(value))
+                  }}
+                  aria-describedby="bcv-source"
+                  className="bg-slate-700 border-slate-600"
+                  placeholder="Ej: 70.50"
+                  required
+                />
+                <p id="bcv-source" className="text-xs text-gray-300" aria-live="polite">{bcvSource}</p>
+              </div>
+
+              <div className="grid grid-cols-3 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="brlSell">BRL Venta (Bs)</Label>
+                  <Input
+                    id="brlSell"
+                    name="brlSell"
+                    value={brlSell}
+                    onChange={handleNumberInput}
+                    className="bg-slate-700 border-slate-600"
+                    placeholder="Ej: 17.00"
+                    required
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="percentage">Porcentaje %</Label>
+                  <Input
+                    id="percentage"
+                    name="percentage"
+                    value={percentage}
+                    onChange={handleNumberInput}
+                    className="bg-slate-700 border-slate-600"
+                    placeholder="Ej: 10"
+                    required
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="brlBuy">BRL Compra (Bs)</Label>
+                  <Input
+                    id="brlBuy"
+                    name="brlBuy"
+                    value={brlBuy}
+                    onChange={handleNumberInput}
+                    className="bg-slate-700 border-slate-600"
+                    placeholder="Ej: 19.21"
+                    required
+                  />
+                </div>
+              </div>
+
+              <Button type="submit" className="w-full" disabled={loading}>
+                {loading ? "Guardando..." : "Guardar Tasas"}
+              </Button>
+            </form>
+          </CardContent>
+        </Card>
+
+        {/* Historial de tasas */}
+        <Card className="bg-slate-800 border-slate-700">
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle className="flex items-center gap-2">
+              <Clock className="h-5 w-5" />
+              <span>Historial de Tasas</span>
+            </CardTitle>
+            <Button variant="outline" size="sm" onClick={loadRatesHistory} disabled={loadingHistory} className="h-8">
+              <RefreshCw className={`h-4 w-4 mr-1 ${loadingHistory ? "animate-spin" : ""}`} />
+              <span>Actualizar</span>
+            </Button>
+          </CardHeader>
+          <CardContent>
+            {loadingHistory ? (
+              <div className="flex justify-center items-center py-8">
+                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white"></div>
+              </div>
+            ) : history.length === 0 ? (
+              <div className="text-center py-6 text-gray-400">No hay historial disponible</div>
+            ) : (
+              <div className="max-h-80 overflow-y-auto border border-slate-700 rounded-md">
+                <Table>
+                  <TableHeader className="sticky top-0 bg-slate-900">
+                    <TableRow>
+                      <TableHead>Fecha</TableHead>
+                      <TableHead>BCV</TableHead>
+                      <TableHead>BRL Venta</TableHead>
+                      <TableHead>BRL Compra</TableHead>
+                      <TableHead>%</TableHead>
+                      <TableHead>Usuario</TableHead>
+                      <TableHead>Acciones</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {history.map((item) => (
+                      <TableRow key={item.id}>
+                        <TableCell className="whitespace-nowrap">
+                          {item.date} {item.time}
+                        </TableCell>
+                        <TableCell>{item.bcv.toFixed(2)}</TableCell>
+                        <TableCell>{item.brlSell.toFixed(2)}</TableCell>
+                        <TableCell>{item.brlBuy.toFixed(2)}</TableCell>
+                        <TableCell>{item.percentage.toFixed(2)}%</TableCell>
+                        <TableCell>{item.updatedBy}</TableCell>
+                        <TableCell>
+                          <div className="flex space-x-2">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => loadFromHistory(item)}
+                              className="h-7 px-2"
+                            >
+                              Cargar
+                            </Button>
+                            <Button
+                              variant="destructive"
+                              size="sm"
+                              onClick={() => openDeleteDialog(item)}
+                              className="h-7 px-2"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Diálogo de confirmación para eliminar */}
+        <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
+          <DialogContent className="bg-slate-900 border-slate-800 text-white">
+            <DialogHeader>
+              <DialogTitle>Confirmar eliminación</DialogTitle>
+              <DialogDescription className="text-gray-400">
+                ¿Estás seguro de que deseas eliminar esta entrada del historial?
+              </DialogDescription>
+            </DialogHeader>
+
+            {selectedHistoryItem && (
+              <div className="py-4">
+                <div className="grid grid-cols-2 gap-2 text-sm">
+                  <div className="text-gray-400">Fecha:</div>
+                  <div>
+                    {selectedHistoryItem.date} {selectedHistoryItem.time}
+                  </div>
+
+                  <div className="text-gray-400">BCV:</div>
+                  <div>{selectedHistoryItem.bcv.toFixed(2)}</div>
+
+                  <div className="text-gray-400">BRL Venta:</div>
+                  <div>{selectedHistoryItem.brlSell.toFixed(2)}</div>
+
+                  <div className="text-gray-400">BRL Compra:</div>
+                  <div>{selectedHistoryItem.brlBuy.toFixed(2)}</div>
+
+                  <div className="text-gray-400">Usuario:</div>
+                  <div>{selectedHistoryItem.updatedBy}</div>
+                </div>
+              </div>
+            )}
+
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setShowDeleteDialog(false)} disabled={loading}>
+                Cancelar
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={() => selectedHistoryItem && deleteHistoryEntry(selectedHistoryItem.id)}
+                disabled={loading}
+              >
+                {loading ? "Eliminando..." : "Eliminar"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </div>
+    </div>
+  )
+}
